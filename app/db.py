@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS observations (
     obs_id         TEXT PRIMARY KEY, -- 观测 ID
     boot_segment   TEXT NOT NULL,    -- 原文：开机段
     counter        INTEGER NOT NULL, -- 原文：段内计数
-    tide_level     REAL NOT NULL,    -- 原文：潮位
+    tide_level     REAL,              -- 原文：潮位（非有限值可存但不供分析）
     utc_ms         INTEGER,          -- 换算结果；NULL 表示待校时
     status         TEXT NOT NULL,    -- ok / pending_calibration / conflict
     reason         TEXT,             -- 状态原因
@@ -41,11 +41,54 @@ CREATE TABLE IF NOT EXISTS observations (
 
 CREATE INDEX IF NOT EXISTS idx_observations_utc_ms ON observations(utc_ms);
 CREATE INDEX IF NOT EXISTS idx_observations_segment ON observations(boot_segment);
+
+CREATE TABLE IF NOT EXISTS inundation_reports (
+    report_id       TEXT PRIMARY KEY, -- 报告号
+    window_start_ms INTEGER NOT NULL, -- 核查窗起（UTC 毫秒，含）
+    window_end_ms   INTEGER NOT NULL, -- 核查窗止（UTC 毫秒，含）
+    padding_ms      INTEGER NOT NULL, -- 向两侧各扩的毫秒数
+    threshold       REAL NOT NULL,    -- 门槛潮位（米）
+    reading_error   REAL NOT NULL,    -- 读数误差（非负，米）
+    max_rate        REAL NOT NULL,    -- 最大升降速率（正数，米/秒）
+    min_duration_ms INTEGER NOT NULL, -- 最短浸水时长（正数，毫秒）
+    created_at      TEXT NOT NULL,    -- 签发时间（UTC ISO-8601）
+    detail_json     TEXT NOT NULL     -- 签发时固定的完整明细快照（只读）
+);
 """
+
+# 增量迁移：旧版本库（PRAGMA user_version=0）平滑升级；语句均为幂等。
+# 版本 1：连续浸水报告表。
+MIGRATIONS = {
+    1: [
+        """
+        CREATE TABLE IF NOT EXISTS inundation_reports (
+            report_id       TEXT PRIMARY KEY,
+            window_start_ms INTEGER NOT NULL,
+            window_end_ms   INTEGER NOT NULL,
+            padding_ms      INTEGER NOT NULL,
+            threshold       REAL NOT NULL,
+            reading_error   REAL NOT NULL,
+            max_rate        REAL NOT NULL,
+            min_duration_ms INTEGER NOT NULL,
+            created_at      TEXT NOT NULL,
+            detail_json     TEXT NOT NULL
+        )
+        """,
+    ],
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    for ver in sorted(MIGRATIONS):
+        if ver > version:
+            for stmt in MIGRATIONS[ver]:
+                conn.execute(stmt)
+            conn.execute(f"PRAGMA user_version = {ver}")
 
 
 def get_conn() -> sqlite3.Connection:
-    """返回进程内共享连接（惰性创建并建表）。"""
+    """返回进程内共享连接（惰性创建、建表并执行增量迁移）。"""
     global _conn
     if _conn is None:
         path = os.environ.get("BUOY_DB", DEFAULT_DB_PATH)
@@ -56,6 +99,7 @@ def get_conn() -> sqlite3.Connection:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
         conn.executescript(SCHEMA)
+        _migrate(conn)
         _conn = conn
     return _conn
 
